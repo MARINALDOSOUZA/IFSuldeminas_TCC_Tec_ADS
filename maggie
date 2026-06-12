@@ -1,0 +1,833 @@
+"""
+Maggie - Gestão Pet Clinic (MVP)
+================================
+
+Sistema de CRM (Customer Relationship Management) e Prontuário Médico 
+desenvolvido para a administração diária de Petshops e Clínicas Veterinárias.
+
+Funcionalidades:
+- Autenticação Baseada em Regras (RBAC): Administrador vs. Operador.
+- Persistência Local (SQLite) com proteção transacional.
+- Geração de Relatórios Clínicos em PDF (FPDF).
+- Interface de Múltiplas Abas (Tkinter/ttk).
+- Máscaras dinâmicas de formatação de dados em tempo real.
+
+Criado Por: 7**.2**.0**-*3
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import sqlite3
+import datetime
+import random
+import string
+import os
+from fpdf import FPDF
+
+class BancoDados:
+    """
+    Gerencia a conexão e as operações transacionais com o banco de dados SQLite.
+    Garante a criação das tabelas fundamentais caso não existam.
+    """
+    
+    def __init__(self, caminho_db):
+        """Inicializa a conexão com o banco de dados e aciona a criação das tabelas."""
+        self.conn = sqlite3.connect(caminho_db)
+        self.cursor = self.conn.cursor()
+        self.criar_tabelas()
+
+    def criar_tabelas(self):
+        """
+        Estrutura o esquema relacional do banco de dados (DDL).
+        Implementa chaves primárias (PRIMARY KEY) e estrangeiras (FOREIGN KEY) 
+        para garantir a integridade referencial dos dados.
+        """
+        self.cursor.executescript('''
+            CREATE TABLE IF NOT EXISTS tutor (
+                cpf TEXT PRIMARY KEY, nome TEXT, celular TEXT, email TEXT,
+                cep TEXT, endereco TEXT, bairro TEXT, cidade TEXT, uf TEXT,
+                usuario_registro TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pet (
+                codigo TEXT PRIMARY KEY, cpf_tutor TEXT, nome TEXT,
+                tipo TEXT, raca TEXT, porte TEXT, dt_nasc TEXT, sexo TEXT, cor TEXT,
+                usuario_registro TEXT,
+                FOREIGN KEY(cpf_tutor) REFERENCES tutor(cpf)
+            );
+            CREATE TABLE IF NOT EXISTS cuidados (
+                codigo_pet TEXT PRIMARY KEY, alimentacao TEXT, horarios TEXT, alergias TEXT,
+                usuario_registro TEXT,
+                FOREIGN KEY(codigo_pet) REFERENCES pet(codigo)
+            );
+            CREATE TABLE IF NOT EXISTS vacinas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pet TEXT, vacina TEXT,
+                protege TEXT, duracao TEXT, proxima_dose TEXT, usuario_registro TEXT,
+                FOREIGN KEY(codigo_pet) REFERENCES pet(codigo)
+            );
+        ''')
+        self.conn.commit()
+
+    def executar(self, query, params=()):
+        """
+        Executa instruções SQL (DML) de forma parametrizada, prevenindo injeção de SQL.
+        Retorna o cursor para iteração (fetchall, fetchone).
+        """
+        self.cursor.execute(query, params)
+        self.conn.commit()
+        return self.cursor
+
+class AppPet:
+    """
+    Controlador principal da Aplicação Desktop (GUI).
+    Gerencia o ciclo de vida das janelas, autenticação e fluxo de formulários.
+    """
+    
+    def __init__(self, root):
+        """Configura a janela principal, dicionários de internacionalização e rotinas de memória."""
+        self.root = root
+        self.root.title("Maggie - Gestão Pet Clinic")
+        self.root.geometry("800x650")
+        
+        self.idioma = "BR"
+        self.tema_escuro = False
+        self.codigo_em_edicao = None
+        self.usuario_logado = None 
+        
+        # Dicionário de internacionalização da interface
+        self.textos = {
+            "BR": {
+                "cadastro": "Cadastro", "tutor": "Tutor", "pet": "Pet", "care": "Cuidados", "vax": "Vacinas", 
+                "search": "Consultar", "report": "Relatório", "delete": "Modificar/Excluir", "settings": "Ajustes", 
+                "save": "Salvar e Continuar", "gen_pdf": "Escolher Pasta e Gerar PDF", "del_btn": "Excluir Registro", "skip": "Pular / Concluir Cadastro",
+                "logout": "Sair do Sistema"
+            },
+            "EN": {
+                "cadastro": "Registration", "tutor": "Owner", "pet": "Pet", "care": "Care", "vax": "Vaccines", 
+                "search": "Search", "report": "Report", "delete": "Modify/Delete", "settings": "Settings", 
+                "save": "Save & Continue", "gen_pdf": "Choose Folder & Generate PDF", "del_btn": "Delete Record", "skip": "Skip / Finish",
+                "logout": "Logout"
+            }
+        }
+        
+        # Cabeçalho global de autoria
+        self.header_autoria = ttk.Label(self.root, text="Criado Por: 7**.2**.0**-*3", font=("Arial", 8, "italic"))
+        self.header_autoria.pack(side="top", anchor="e", padx=10, pady=2)
+
+        # Divisão da interface em dois frames excludentes
+        self.frame_login = ttk.Frame(self.root)
+        self.frame_sistema = ttk.Frame(self.root)
+        
+        # Lógica de persistência do caminho do banco de dados
+        self.arquivo_config = "maggie_config.txt"
+        self.pasta_destino = None
+        
+        # Valida se a memória de pasta existe e se o caminho gravado é válido no SO
+        if os.path.exists(self.arquivo_config):
+            with open(self.arquivo_config, "r") as f:
+                caminho_salvo = f.read().strip()
+            if os.path.exists(caminho_salvo):
+                self.pasta_destino = caminho_salvo
+                
+        self.construir_tela_login()
+        self.aplicar_tema()
+
+    # ==========================================
+    # MÓDULO DE AUTENTICAÇÃO E INICIALIZAÇÃO
+    # ==========================================
+
+    def construir_tela_login(self):
+        """Monta o formulário de login inicial e avalia se é a primeira execução do sistema."""
+        self.frame_login.pack(expand=True, fill="both")
+        
+        frame_centro = ttk.Frame(self.frame_login)
+        frame_centro.place(relx=0.5, rely=0.5, anchor="center")
+        
+        ttk.Label(frame_centro, text="🔐 Acesso ao Sistema", font=("Arial", 16, "bold")).pack(pady=15)
+        
+        # Exibe aviso restrito caso a infraestrutura de pastas não tenha sido criada
+        if not self.pasta_destino:
+            ttk.Label(frame_centro, text="PRIMEIRO ACESSO\nConfiguração restrita ao Administrador.", foreground="#d9534f", justify="center").pack(pady=10)
+            
+        ttk.Label(frame_centro, text="Usuário (ADM ou OPER):").pack(pady=5)
+        self.ent_usuario = ttk.Entry(frame_centro, width=30)
+        self.ent_usuario.pack(pady=5)
+        
+        ttk.Label(frame_centro, text="Senha:").pack(pady=5)
+        self.ent_senha = ttk.Entry(frame_centro, width=30, show="*")
+        self.ent_senha.pack(pady=5)
+        
+        ttk.Button(frame_centro, text="Entrar", command=self.validar_login).pack(pady=20)
+        
+        # Mapeamento da tecla Enter para agilizar login
+        self.root.bind('<Return>', lambda event: self.validar_login())
+
+    def validar_login(self):
+        """Cruza as credenciais fornecidas e define o nível de permissão (ADM ou OPER)."""
+        usuario = self.ent_usuario.get().strip().upper()
+        senha = self.ent_senha.get().strip()
+        
+        if not self.pasta_destino:
+            # Trava de Segurança: Apenas o ADM pode provisionar o banco de dados inicial
+            if usuario == "ADM" and senha == "147":
+                self.configurar_primeiro_acesso()
+            else:
+                messagebox.showerror("Acesso Negado", "O primeiro acesso para criação do banco de dados\ndeve ser feito pelo usuário ADM.")
+        else:
+            if usuario == "ADM" and senha == "147":
+                self.usuario_logado = "ADM"
+                self.iniciar_sistema()
+            elif usuario == "OPER" and senha == "123":
+                self.usuario_logado = "OPER"
+                self.iniciar_sistema()
+            else:
+                messagebox.showerror("Acesso Negado", "Usuário ou senha inválidos.")
+
+    def configurar_primeiro_acesso(self):
+        """Provisiona a pasta local e cria o arquivo de configuração de memória (maggie_config.txt)."""
+        pasta_base = filedialog.askdirectory(title="Selecione a pasta principal para salvar os dados")
+        if not pasta_base:
+            messagebox.showwarning("Aviso", "Configuração cancelada.")
+            return
+            
+        self.pasta_destino = os.path.join(pasta_base, 'maggie_dados')
+        os.makedirs(self.pasta_destino, exist_ok=True)
+        
+        with open(self.arquivo_config, "w") as f:
+            f.write(self.pasta_destino)
+            
+        self.usuario_logado = "ADM"
+        self.iniciar_sistema()
+
+    def iniciar_sistema(self):
+        """Constrói a interface principal do CRM de acordo com o nível de permissão (RBAC)."""
+        self.root.unbind('<Return>') # Previne interferência do Enter nas caixas de texto
+        
+        # Estabelece conexão ou cria o banco no local provisionado
+        caminho_db = os.path.join(self.pasta_destino, 'pet_clinic.db')
+        self.db = BancoDados(caminho_db)
+        
+        # Transição de telas
+        self.frame_login.pack_forget()
+        self.frame_sistema.pack(expand=True, fill="both")
+        
+        # Limpeza forçada de instâncias para garantir integridade após logout
+        for widget in self.frame_sistema.winfo_children():
+            widget.destroy()
+            
+        # Barra superior com status da sessão
+        frame_topo = ttk.Frame(self.frame_sistema)
+        frame_topo.pack(fill="x", padx=10, pady=5)
+        ttk.Label(frame_topo, text=f"Logado como: {self.usuario_logado}", font=("Arial", 9, "bold")).pack(side="left")
+        self.btn_logout = ttk.Button(frame_topo, text=self.textos[self.idioma]["logout"], command=self.fazer_logout)
+        self.btn_logout.pack(side="right")
+
+        # Configuração do Container de Abas (Notebook Principal)
+        self.notebook = ttk.Notebook(self.frame_sistema)
+        self.notebook.pack(expand=True, fill="both", padx=10, pady=5)
+
+        self.abas = {}
+        for key in ["cadastro", "search", "report", "delete", "settings"]:
+            frame = ttk.Frame(self.notebook)
+            self.abas[key] = frame
+            self.notebook.add(frame, text=self.textos[self.idioma][key])
+
+        # RBAC: Oculta funcionalidades destrutivas para o Operador
+        if self.usuario_logado == "OPER":
+            self.notebook.hide(self.abas["delete"])
+
+        # Configuração do Sub-Notebook (Fluxo de Cadastro)
+        self.sub_notebook = ttk.Notebook(self.abas["cadastro"])
+        self.sub_notebook.pack(expand=True, fill="both", padx=5, pady=5)
+        
+        self.sub_abas = {}
+        for key in ["tutor", "pet", "care", "vax"]:
+            frame = ttk.Frame(self.sub_notebook)
+            self.sub_abas[key] = frame
+            self.sub_notebook.add(frame, text=self.textos[self.idioma][key])
+
+        # Chamada dos módulos de construção
+        self.construir_aba_tutor()
+        self.construir_aba_pet()
+        self.construir_aba_cuidados()
+        self.construir_aba_vacinas()
+        self.construir_aba_consulta()
+        self.construir_aba_relatorio()
+        self.construir_aba_exclusao()
+        self.construir_aba_ajustes()
+        
+        self.aplicar_tema()
+
+    def fazer_logout(self):
+        """Encerra a sessão atual e destrói o contexto de memória da interface."""
+        self.usuario_logado = None
+        self.ent_usuario.delete(0, tk.END)
+        self.ent_senha.delete(0, tk.END)
+        
+        self.frame_sistema.pack_forget()
+        self.frame_login.pack(expand=True, fill="both")
+        self.root.bind('<Return>', lambda event: self.validar_login())
+
+    # ==========================================
+    # MÓDULO DE VALIDAÇÃO E MÁSCARAS (REGEX)
+    # ==========================================
+
+    def formatar_data(self, event):
+        """Aplica a máscara DD/MM/AAAA para datas."""
+        if event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down']: return
+        entry = event.widget
+        texto = entry.get()
+        digitos = ''.join(filter(str.isdigit, texto))[:8]
+        formatado = ""
+        for i, d in enumerate(digitos):
+            if i in [2, 4]: formatado += "/"
+            formatado += d
+        if texto != formatado:
+            entry.delete(0, tk.END); entry.insert(0, formatado)
+
+    def formatar_cpf_cadastro(self, event):
+        """Aplica a máscara 000.000.000-00 para o CPF."""
+        if event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down']: return
+        entry = self.entries_tutor["cpf"]
+        texto = entry.get()
+        digitos = ''.join(filter(str.isdigit, texto))[:11]
+        formatado = ""
+        for i, d in enumerate(digitos):
+            if i in [3, 6]: formatado += "."
+            if i == 9: formatado += "-"
+            formatado += d
+        if texto != formatado:
+            entry.delete(0, tk.END); entry.insert(0, formatado)
+
+    def formatar_celular(self, event):
+        """Aplica a máscara (00) 0 0000-0000 para telefones brasileiros."""
+        if event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down']: return
+        entry = self.entries_tutor["celular"]
+        texto = entry.get()
+        digitos = ''.join(filter(str.isdigit, texto))[:11]
+        formatado = ""
+        for i, d in enumerate(digitos):
+            if i == 0: formatado += "("
+            if i == 2: formatado += ") "
+            if i == 3: formatado += " "
+            if i == 7: formatado += "-"
+            formatado += d
+        if texto != formatado:
+            entry.delete(0, tk.END); entry.insert(0, formatado)
+
+    def formatar_cep(self, event):
+        """Aplica a máscara 00.000-000 para CEPs."""
+        if event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down']: return
+        entry = self.entries_tutor["cep"]
+        texto = entry.get()
+        digitos = ''.join(filter(str.isdigit, texto))[:8]
+        formatado = ""
+        for i, d in enumerate(digitos):
+            if i == 2: formatado += "."
+            if i == 5: formatado += "-"
+            formatado += d
+        if texto != formatado:
+            entry.delete(0, tk.END); entry.insert(0, formatado)
+
+    def formatar_campo_busca(self, event, entry_widget, tipo_var):
+        """
+        Formatação inteligente de input:
+        Alterna entre a máscara de CPF e a de Código de Pet (AAA-000) baseado no Radiobutton selecionado.
+        """
+        if event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down']: return
+        tipo = tipo_var.get()
+        texto = entry_widget.get()
+        if tipo == "CPF":
+            digitos = ''.join(filter(str.isdigit, texto))[:11]
+            formatado = ""
+            for i, d in enumerate(digitos):
+                if i in [3, 6]: formatado += "."
+                if i == 9: formatado += "-"
+                formatado += d
+            if texto != formatado:
+                entry_widget.delete(0, tk.END); entry_widget.insert(0, formatado)
+        elif tipo == "COD":
+            chars = ''.join(c for c in texto if c.isalnum()).upper()[:6]
+            formatado = ""
+            for i, c in enumerate(chars):
+                if i == 3: formatado += "-"
+                formatado += c
+            if texto != formatado:
+                entry_widget.delete(0, tk.END); entry_widget.insert(0, formatado)
+
+    # ==========================================
+    # MÓDULOS DE INTERFACE E OPERAÇÕES CRUD
+    # ==========================================
+
+    # --- SUB-ABA 1: TUTOR ---
+    def construir_aba_tutor(self):
+        f = self.sub_abas["tutor"]
+        campos = [("CPF *:", "cpf"), ("Nome *:", "nome"), ("Celular:", "celular"), ("E-mail:", "email"), 
+                  ("CEP:", "cep"), ("Endereço:", "endereco"), ("Bairro:", "bairro"), ("Cidade:", "cidade")]
+        self.vars_tutor = {}; self.entries_tutor = {}
+        for i, (label_text, var_name) in enumerate(campos):
+            ttk.Label(f, text=label_text).grid(row=i, column=0, sticky="w", padx=10, pady=4)
+            var = tk.StringVar()
+            entry = ttk.Entry(f, width=40, textvariable=var)
+            entry.grid(row=i, column=1, padx=10, pady=4, sticky="w")
+            self.vars_tutor[var_name] = var; self.entries_tutor[var_name] = entry
+            
+            # Binding dinâmico de eventos de teclado (KeyRelease) para ativação de máscaras
+            if var_name == "cpf": entry.bind("<KeyRelease>", self.formatar_cpf_cadastro)
+            if var_name == "celular": entry.bind("<KeyRelease>", self.formatar_celular)
+            if var_name == "cep": entry.bind("<KeyRelease>", self.formatar_cep)
+            
+        r = len(campos)
+        ttk.Label(f, text="UF:").grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        self.var_uf = tk.StringVar()
+        ufs_br = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
+        cb_uf = ttk.Combobox(f, values=ufs_br, textvariable=self.var_uf, state="readonly", width=37)
+        cb_uf.grid(row=r, column=1, padx=10, pady=4, sticky="w")
+        self.vars_tutor["uf"] = self.var_uf
+
+        ttk.Button(f, text=self.textos[self.idioma]["save"], command=self.salvar_tutor).grid(row=r+1, column=1, pady=15, sticky="w", padx=10)
+
+    def salvar_tutor(self):
+        """
+        Salva ou atualiza os dados do tutor.
+        Integra lógica de prevenção de duplicação: alerta o usuário se o CPF já existir 
+        e oferece a opção de modificar os dados (*Update*) ou ignorar (*Skip*).
+        """
+        v = {k: var.get().strip() for k, var in self.vars_tutor.items()}
+        if not v["cpf"] or not v["nome"]: return messagebox.showwarning("Aviso", "CPF e Nome são obrigatórios para prosseguir!")
+            
+        try:
+            tutor_existe = self.db.executar("SELECT nome FROM tutor WHERE cpf=?", (v["cpf"],)).fetchone()
+            if tutor_existe:
+                decisao = messagebox.askyesno("Tutor Cadastrado", f"O CPF {v['cpf']} já pertence a {tutor_existe[0]}.\n\nDeseja ATUALIZAR os dados deste tutor ou PROSSEGUIR para o cadastro de Pet?")
+                if decisao: 
+                    self.db.executar("UPDATE tutor SET nome=?, celular=?, email=?, cep=?, endereco=?, bairro=?, cidade=?, uf=?, usuario_registro=? WHERE cpf=?", 
+                                     (v["nome"], v["celular"], v["email"], v["cep"], v["endereco"], v["bairro"], v["cidade"], v["uf"], self.usuario_logado, v["cpf"]))
+                    messagebox.showinfo("Sucesso", "Dados do tutor atualizados!")
+            else:
+                self.db.executar("INSERT INTO tutor VALUES (?,?,?,?,?,?,?,?,?,?)", 
+                                 (v["cpf"], v["nome"], v["celular"], v["email"], v["cep"], v["endereco"], v["bairro"], v["cidade"], v["uf"], self.usuario_logado))
+                messagebox.showinfo("Sucesso", "Tutor cadastrado! Avançando para o cadastro do Pet.")
+
+            # Avança o fluxo carregando a Primary Key (CPF) para a Foreign Key do Pet
+            self.ent_pet_cpf.config(state="normal"); self.ent_pet_cpf.delete(0, tk.END); self.ent_pet_cpf.insert(0, v["cpf"]); self.ent_pet_cpf.config(state="readonly")
+            self.sub_notebook.select(self.sub_abas["pet"])
+        except Exception as e:
+            messagebox.showerror("Erro", str(e))
+
+    # --- SUB-ABA 2: PET ---
+    def construir_aba_pet(self):
+        f = self.sub_abas["pet"]
+        ttk.Label(f, text="CPF do Tutor (Vinculado):").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        self.ent_pet_cpf = ttk.Entry(f, width=40, state="readonly"); self.ent_pet_cpf.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Nome do Pet *:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        self.ent_pet_nome = ttk.Entry(f, width=40); self.ent_pet_nome.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Tipo *:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        self.cb_pet_tipo = ttk.Combobox(f, values=["Cão", "Gato"], state="readonly", width=37); self.cb_pet_tipo.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Raça:").grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        self.ent_pet_raca = ttk.Entry(f, width=40); self.ent_pet_raca.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Porte *:").grid(row=4, column=0, sticky="w", padx=10, pady=5)
+        self.cb_pet_porte = ttk.Combobox(f, values=["Pequeno", "Médio", "Grande"], state="readonly", width=37); self.cb_pet_porte.grid(row=4, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Data de Nasc. (DD/MM/AAAA) *:").grid(row=5, column=0, sticky="w", padx=10, pady=5)
+        self.ent_pet_nasc = ttk.Entry(f, width=40); self.ent_pet_nasc.grid(row=5, column=1, padx=10, pady=5, sticky="w")
+        self.ent_pet_nasc.bind("<KeyRelease>", self.formatar_data)
+        self.ent_pet_nasc.bind("<FocusOut>", self.calcular_idade) # Dispara cálculo dinâmico de idade
+
+        self.lbl_idade = ttk.Label(f, text="Idade: -", font=("Arial", 9, "bold")); self.lbl_idade.grid(row=5, column=2, padx=5, sticky="w")
+
+        ttk.Label(f, text="Sexo *:").grid(row=6, column=0, sticky="w", padx=10, pady=5)
+        self.cb_pet_sexo = ttk.Combobox(f, values=["M", "F"], state="readonly", width=37); self.cb_pet_sexo.grid(row=6, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Label(f, text="Cor:").grid(row=7, column=0, sticky="w", padx=10, pady=5)
+        self.ent_pet_cor = ttk.Entry(f, width=40); self.ent_pet_cor.grid(row=7, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Button(f, text=self.textos[self.idioma]["save"], command=self.salvar_pet).grid(row=8, column=1, pady=15, sticky="w", padx=10)
+
+    def calcular_idade(self, event):
+        """Converte o input de string para datetime e calcula a idade real baseada na data atual do SO."""
+        try:
+            nasc = datetime.datetime.strptime(self.ent_pet_nasc.get().strip(), "%d/%m/%Y")
+            hoje = datetime.datetime.today()
+            anos = hoje.year - nasc.year - ((hoje.month, hoje.day) < (nasc.month, nasc.day))
+            self.lbl_idade.config(text=f"Idade: {anos} anos")
+        except:
+            self.lbl_idade.config(text="Idade: Inválida")
+
+    def salvar_pet(self):
+        """
+        Salva ou atualiza os dados biológicos do Pet. 
+        Gera algoritmicamente um código alfa-numérico único caso seja um registro novo.
+        """
+        cpf = self.ent_pet_cpf.get(); nome = self.ent_pet_nome.get().strip(); tipo = self.cb_pet_tipo.get()
+        raca = self.ent_pet_raca.get().strip(); porte = self.cb_pet_porte.get(); nasc = self.ent_pet_nasc.get().strip()
+        sexo = self.cb_pet_sexo.get(); cor = self.ent_pet_cor.get().strip()
+
+        if not cpf: return messagebox.showwarning("Aviso", "Cadastre um Tutor primeiro!")
+        if not (nome and tipo and porte and nasc and sexo): return messagebox.showwarning("Aviso", "Os campos marcados com * são obrigatórios!")
+
+        try:
+            # Modo de Edição Ativo (Update)
+            if self.codigo_em_edicao:
+                codigo = self.codigo_em_edicao
+                self.db.executar("UPDATE pet SET cpf_tutor=?, nome=?, tipo=?, raca=?, porte=?, dt_nasc=?, sexo=?, cor=?, usuario_registro=? WHERE codigo=?", 
+                                 (cpf, nome, tipo, raca, porte, nasc, sexo, cor, self.usuario_logado, codigo))
+                messagebox.showinfo("Sucesso", f"Pet código {codigo} atualizado!")
+                self.codigo_em_edicao = None
+            # Modo Criação Ativo (Insert)
+            else:
+                letras = ''.join(random.choices(string.ascii_uppercase, k=3)); numeros = ''.join(random.choices(string.digits, k=3))
+                codigo = f"{letras}-{numeros}"
+                self.db.executar("INSERT INTO pet VALUES (?,?,?,?,?,?,?,?,?,?)", 
+                                 (codigo, cpf, nome, tipo, raca, porte, nasc, sexo, cor, self.usuario_logado))
+                messagebox.showinfo("Sucesso", f"Pet registrado com o Código: {codigo}\nAvançando para Cuidados.")
+            
+            # Carrega a PK gerada (Código) nas foreign keys de Cuidados e Vacinas
+            for campo in [self.ent_care_cod, self.ent_vax_cod]:
+                campo.config(state="normal"); campo.delete(0, tk.END); campo.insert(0, codigo); campo.config(state="readonly")
+            self.sub_notebook.select(self.sub_abas["care"])
+        except Exception as e:
+            messagebox.showerror("Erro", str(e))
+
+    # --- SUB-ABA 3: CUIDADOS ---
+    def construir_aba_cuidados(self):
+        f = self.sub_abas["care"]
+        ttk.Label(f, text="Código do Pet (Vinculado):").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        self.ent_care_cod = ttk.Entry(f, width=40, state="readonly"); self.ent_care_cod.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+        
+        ttk.Label(f, text="O que come *:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        self.ent_care_comida = ttk.Entry(f, width=40); self.ent_care_comida.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+        
+        ttk.Label(f, text="Hora das refeições *:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        self.ent_care_hora = ttk.Entry(f, width=40); self.ent_care_hora.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+        
+        ttk.Label(f, text="Alérgico a o quê? *:").grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        self.ent_care_alergia = ttk.Entry(f, width=40); self.ent_care_alergia.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+        ttk.Button(f, text=self.textos[self.idioma]["save"], command=self.salvar_cuidados).grid(row=4, column=1, pady=15, sticky="w", padx=10)
+
+    def salvar_cuidados(self):
+        cod = self.ent_care_cod.get(); comida = self.ent_care_comida.get().strip()
+        hora = self.ent_care_hora.get().strip(); alergia = self.ent_care_alergia.get().strip()
+        if not cod: return messagebox.showwarning("Aviso", "Falta o vínculo do código do pet!")
+        if not (comida and hora and alergia): return messagebox.showwarning("Aviso", "Todos os campos de cuidados são obrigatórios!")
+        
+        self.db.executar("INSERT OR REPLACE INTO cuidados VALUES (?,?,?,?,?)", (cod, comida, hora, alergia, self.usuario_logado))
+        messagebox.showinfo("Sucesso", "Cuidados registrados! Avançando para Vacinas.")
+        self.sub_notebook.select(self.sub_abas["vax"])
+
+    # --- SUB-ABA 4: VACINAS ---
+    def construir_aba_vacinas(self):
+        f = self.sub_abas["vax"]
+        ttk.Label(f, text="Código do Pet (Vinculado):").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        self.ent_vax_cod = ttk.Entry(f, width=40, state="readonly"); self.ent_vax_cod.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        campos = [("Vacina:", "vacina"), ("Protege contra:", "protege"), ("Duração:", "duracao"), ("Próxima Dose (Data):", "proxima")]
+        self.ent_vax_inputs = {}
+        for i, (label_text, var_name) in enumerate(campos, start=1):
+            ttk.Label(f, text=label_text).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            entry = ttk.Entry(f, width=40); entry.grid(row=i, column=1, padx=10, pady=5, sticky="w")
+            self.ent_vax_inputs[var_name] = entry
+            if var_name == "proxima": entry.bind("<KeyRelease>", self.formatar_data)
+
+        frame_botoes = ttk.Frame(f)
+        frame_botoes.grid(row=len(campos)+1, column=1, pady=10, sticky="w", padx=10)
+        ttk.Button(frame_botoes, text="Adicionar Vacina", command=self.salvar_vacina).pack(side="left", padx=5)
+        self.btn_pular = ttk.Button(frame_botoes, text=self.textos[self.idioma]["skip"], command=self.concluir_cadastro)
+        self.btn_pular.pack(side="left", padx=5)
+        
+        # Grid para visualização rápida dos registros médicos
+        colunas = ("Vacina", "Protege", "Duração", "Próxima")
+        self.tree_vax = ttk.Treeview(f, columns=colunas, show="headings", height=4)
+        for col in colunas: self.tree_vax.heading(col, text=col)
+        self.tree_vax.grid(row=len(campos)+2, column=0, columnspan=3, pady=10, padx=10, sticky="nsew")
+
+    def salvar_vacina(self):
+        """Possibilita inserir (N) registros de vacina para (1) único Pet."""
+        cod = self.ent_vax_cod.get(); v = {k: e.get().strip() for k, e in self.ent_vax_inputs.items()}
+        if not cod: return messagebox.showwarning("Aviso", "Falta o vínculo do código do pet!")
+        if not v["vacina"]: return messagebox.showwarning("Aviso", "Insira pelo menos o nome da vacina!")
+
+        self.db.executar("INSERT INTO vacinas (codigo_pet, vacina, protege, duracao, proxima_dose, usuario_registro) VALUES (?,?,?,?,?,?)",
+                         (cod, v["vacina"], v["protege"], v["duracao"], v["proxima"], self.usuario_logado))
+        self.tree_vax.insert("", tk.END, values=(v["vacina"], v["protege"], v["duracao"], v["proxima"]))
+        messagebox.showinfo("Sucesso", "Vacina adicionada ao histórico do Pet!")
+        for e in self.ent_vax_inputs.values(): e.delete(0, tk.END) # Reseta entradas para mais vacinas
+
+    def concluir_cadastro(self):
+        """Finaliza a arquitetura do Sub-Notebook (Cadastro) e retorna o usuário à hierarquia principal."""
+        messagebox.showinfo("Finalizado", "Dados salvos e fluxo de abas concluído!")
+        self.notebook.select(self.abas["search"]) 
+
+    # --- ABA 5: CONSULTA RÁPIDA ---
+    def construir_aba_consulta(self):
+        f = self.abas["search"]
+        frame_opcoes = ttk.Frame(f); frame_opcoes.pack(pady=5)
+        
+        self.var_busca_tipo = tk.StringVar(value="CPF")
+        ttk.Radiobutton(frame_opcoes, text="CPF do Dono", variable=self.var_busca_tipo, value="CPF", command=lambda: self.ent_busca.delete(0, tk.END)).pack(side="left", padx=10)
+        ttk.Radiobutton(frame_opcoes, text="Cód. do Pet", variable=self.var_busca_tipo, value="COD", command=lambda: self.ent_busca.delete(0, tk.END)).pack(side="left", padx=10)
+
+        self.ent_busca = ttk.Entry(f, width=30); self.ent_busca.pack(pady=5)
+        self.ent_busca.bind("<KeyRelease>", lambda e: self.formatar_campo_busca(e, self.ent_busca, self.var_busca_tipo))
+        
+        ttk.Button(f, text="Consultar", command=self.consultar).pack(pady=5)
+        self.txt_resultado = tk.Text(f, height=12, width=85); self.txt_resultado.pack(pady=10, padx=10)
+
+    def consultar(self):
+        """Pesquisa simplificada utilizando querys paramétricas por Tutor ou Pet."""
+        termo = self.ent_busca.get().strip(); tipo = self.var_busca_tipo.get()
+        self.txt_resultado.delete(1.0, tk.END)
+        if not termo: return
+        
+        if tipo == "CPF": pets = self.db.executar("SELECT * FROM pet WHERE cpf_tutor=?", (termo,)).fetchall()
+        else: pets = self.db.executar("SELECT * FROM pet WHERE codigo=?", (termo,)).fetchall()
+            
+        if not pets:
+            self.txt_resultado.insert(tk.END, "Nenhum pet localizado com este critério.")
+            return
+            
+        for p in pets:
+            self.txt_resultado.insert(tk.END, f"CÓD: {p[0]} | NOME: {p[2]} | TIPO: {p[3]} | RAÇA: {p[4]} | SEXO: {p[7]}\n")
+
+    # --- ABA 6: RELATÓRIO CLÍNICO (PDF) ---
+    def construir_aba_relatorio(self):
+        f = self.abas["report"]
+        frame_opcoes = ttk.Frame(f); frame_opcoes.pack(pady=5)
+        
+        self.var_rel_tipo = tk.StringVar(value="CPF")
+        ttk.Radiobutton(frame_opcoes, text="CPF do Dono", variable=self.var_rel_tipo, value="CPF", command=lambda: self.ent_rel_busca.delete(0, tk.END)).pack(side="left", padx=10)
+        ttk.Radiobutton(frame_opcoes, text="Cód. do Pet", variable=self.var_rel_tipo, value="COD", command=lambda: self.ent_rel_busca.delete(0, tk.END)).pack(side="left", padx=10)
+
+        frame_busca = ttk.Frame(f); frame_busca.pack(pady=5)
+        self.ent_rel_busca = ttk.Entry(frame_busca, width=30); self.ent_rel_busca.pack(side="left", padx=5)
+        self.ent_rel_busca.bind("<KeyRelease>", lambda e: self.formatar_campo_busca(e, self.ent_rel_busca, self.var_rel_tipo))
+        
+        ttk.Button(frame_busca, text="Carregar Dados", command=self.carregar_relatorio).pack(side="left")
+        self.txt_relatorio = tk.Text(f, height=15, width=85); self.txt_relatorio.pack(pady=10, padx=10)
+        self.btn_pdf = ttk.Button(f, text=self.textos[self.idioma]["gen_pdf"], command=self.gerar_pdf); self.btn_pdf.pack(pady=5)
+
+    def carregar_relatorio(self):
+        """
+        Executa múltiplos JOINs/Buscas iterativas em todo o banco (Tutor, Pet, Cuidados e Vacinas)
+        Formata o texto extraído para visualização e preparação do buffer do PDF.
+        """
+        termo = self.ent_rel_busca.get().strip(); tipo = self.var_rel_tipo.get()
+        self.txt_relatorio.delete(1.0, tk.END); self.relatorio_dados = None
+        if not termo: return
+        
+        if tipo == "CPF": pets = self.db.executar("SELECT * FROM pet WHERE cpf_tutor=?", (termo,)).fetchall()
+        else: pets = self.db.executar("SELECT * FROM pet WHERE codigo=?", (termo,)).fetchall()
+            
+        if not pets:
+            self.txt_relatorio.insert(tk.END, "Nenhum registro encontrado.")
+            return
+            
+        if len(pets) > 1:
+            messagebox.showinfo("Aviso", "Múltiplos pets encontrados para este CPF.\nMostrando relatório do primeiro. Para um relatório específico, pesquise pela opção Código do Pet.")
+            
+        pet = pets[0]
+        tutor = self.db.executar("SELECT * FROM tutor WHERE cpf=?", (pet[1],)).fetchone()
+        cuidados = self.db.executar("SELECT * FROM cuidados WHERE codigo_pet=?", (pet[0],)).fetchone()
+        vacinas = self.db.executar("SELECT * FROM vacinas WHERE codigo_pet=?", (pet[0],)).fetchall()
+        
+        # Concatenação e formatação em string de exibição/buffer
+        texto = f"========== RELATÓRIO CLÍNICO ==========\n\n"
+        texto += f"--- DADOS DO TUTOR ---\n"
+        texto += f"Nome: {tutor[1]} | CPF: {tutor[0]} | Celular: {tutor[2]}\n"
+        texto += f"E-mail: {tutor[3]} | Endereço: {tutor[5]}, {tutor[6]} - {tutor[7]}/{tutor[8]} - CEP: {tutor[4]}\n"
+        texto += f"[Registrado/Atualizado por: {tutor[9]}]\n\n"
+        
+        texto += f"--- DADOS DO PET ---\n"
+        texto += f"Nome: {pet[2]} | Código: {pet[0]} | Tipo: {pet[3]} | Raça: {pet[4]}\n"
+        texto += f"Porte: {pet[5]} | Nasc.: {pet[6]} | Sexo: {pet[7]} | Cor: {pet[8]}\n"
+        texto += f"[Registrado/Atualizado por: {pet[9]}]\n\n"
+        
+        if cuidados:
+            texto += f"--- CUIDADOS ---\n"
+            texto += f"Alimentação: {cuidados[1]}\nHorários: {cuidados[2]}\nAlergias: {cuidados[3]}\n"
+            texto += f"[Registrado/Atualizado por: {cuidados[4]}]\n\n"
+            
+        if vacinas:
+            texto += f"--- VACINAS ---\n"
+            for v in vacinas:
+                texto += f"- {v[2]} (Protege: {v[3]} | Duração: {v[4]} | Próx. Dose: {v[5]}) [por: {v[6]}]\n"
+        
+        self.txt_relatorio.insert(tk.END, texto)
+        self.relatorio_dados = {"tutor": tutor, "pet": pet, "texto": texto} # Salva em dict para fácil acesso pela função de PDF
+
+    def gerar_pdf(self):
+        """
+        Gera a compilação do relatório em formato `.pdf`.
+        Utiliza `latin-1` para converter carateres e evitar desconfiguração de acentos PT-BR.
+        Utiliza `multi_cell` para permitir quebra de linha em textos longos.
+        """
+        if getattr(self, 'relatorio_dados', None) is None: return messagebox.showwarning("Aviso", "Por favor, carregue os dados de um pet primeiro.")
+            
+        tutor = self.relatorio_dados["tutor"]; pet = self.relatorio_dados["pet"]
+        cpf_limpo = tutor[0].replace(".", "").replace("-", ""); cod_limpo = pet[0].replace("-", "")
+        agora = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nome_arquivo = f"{cpf_limpo}.{cod_limpo}.{agora}.pdf"
+        
+        caminho_salvar = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=nome_arquivo, title="Salvar Relatório PDF", filetypes=[("PDF Files", "*.pdf")])
+        if not caminho_salvar: return
+        
+        pdf = FPDF(); pdf.add_page(); pdf.set_font("Arial", size=11)
+        for linha in self.relatorio_dados["texto"].split('\n'):
+            # Encodifica texto e utiliza multi_cell
+            texto_limpo = linha.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 6, txt=texto_limpo)
+            
+        try:
+            pdf.output(caminho_salvar)
+            messagebox.showinfo("Sucesso", f"Documento salvo com sucesso em:\n{caminho_salvar}")
+        except Exception as e:
+            messagebox.showerror("Erro ao salvar PDF", str(e))
+
+    # --- ABA 7: MANUTENÇÃO / EXCLUSÃO (Somente ADM) ---
+    def construir_aba_exclusao(self):
+        f = self.abas["delete"]
+        frame_opcoes = ttk.Frame(f); frame_opcoes.pack(pady=5)
+        
+        self.var_mod_tipo = tk.StringVar(value="CPF")
+        ttk.Radiobutton(frame_opcoes, text="CPF do Dono", variable=self.var_mod_tipo, value="CPF", command=lambda: self.ent_mod_busca.delete(0, tk.END)).pack(side="left", padx=10)
+        ttk.Radiobutton(frame_opcoes, text="Cód. do Pet", variable=self.var_mod_tipo, value="COD", command=lambda: self.ent_mod_busca.delete(0, tk.END)).pack(side="left", padx=10)
+
+        frame_busca = ttk.Frame(f); frame_busca.pack(pady=5)
+        self.ent_mod_busca = ttk.Entry(frame_busca, width=30); self.ent_mod_busca.pack(side="left", padx=5)
+        self.ent_mod_busca.bind("<KeyRelease>", lambda e: self.formatar_campo_busca(e, self.ent_mod_busca, self.var_mod_tipo))
+        
+        ttk.Button(frame_busca, text="Buscar", command=self.buscar_mod).pack(side="left")
+        
+        colunas = ("Código", "Nome do Pet", "CPF do Tutor")
+        self.tree_mod = ttk.Treeview(f, columns=colunas, show="headings", height=5)
+        for col in colunas: self.tree_mod.heading(col, text=col)
+        self.tree_mod.pack(pady=10, fill="x", padx=10)
+        
+        frame_acoes = ttk.Frame(f); frame_acoes.pack(pady=10)
+        ttk.Button(frame_acoes, text="Modificar Selecionado", command=self.carregar_modificacao).pack(side="left", padx=10)
+        ttk.Button(frame_acoes, text="Excluir Selecionado", command=self.excluir).pack(side="left", padx=10)
+
+    def buscar_mod(self):
+        termo = self.ent_mod_busca.get().strip(); tipo = self.var_mod_tipo.get()
+        for row in self.tree_mod.get_children(): self.tree_mod.delete(row)
+        if not termo: return
+        
+        if tipo == "CPF": pets = self.db.executar("SELECT codigo, nome, cpf_tutor FROM pet WHERE cpf_tutor=?", (termo,)).fetchall()
+        else: pets = self.db.executar("SELECT codigo, nome, cpf_tutor FROM pet WHERE codigo=?", (termo,)).fetchall()
+        for p in pets: self.tree_mod.insert("", tk.END, values=(p[0], p[1], p[2]))
+
+    def excluir(self):
+        """Eliminação em Cascata: Respeita as dependências apagando as foreign keys primeiro."""
+        selecionado = self.tree_mod.selection()
+        if not selecionado: return messagebox.showwarning("Aviso", "Selecione um registro na lista.")
+        
+        codigo_pet = self.tree_mod.item(selecionado[0], "values")[0]
+        confirmar = messagebox.askyesno("Confirmação", f"Deseja realmente excluir todos os dados do pet {codigo_pet}?")
+        if confirmar:
+            # Exclui das dependentes para não violar chaves estrangeiras
+            self.db.executar("DELETE FROM vacinas WHERE codigo_pet=?", (codigo_pet,))
+            self.db.executar("DELETE FROM cuidados WHERE codigo_pet=?", (codigo_pet,))
+            self.db.executar("DELETE FROM pet WHERE codigo=?", (codigo_pet,))
+            messagebox.showinfo("Sucesso", "Registros removidos com sucesso.")
+            self.tree_mod.delete(selecionado[0])
+
+    def carregar_modificacao(self):
+        """Recupera dados para edição reversa. Aciona flag self.codigo_em_edicao."""
+        selecionado = self.tree_mod.selection()
+        if not selecionado: return messagebox.showwarning("Aviso", "Selecione um registro na lista.")
+        
+        codigo_pet = self.tree_mod.item(selecionado[0], "values")[0]
+        cpf_tutor = self.tree_mod.item(selecionado[0], "values")[2]
+        
+        tutor = self.db.executar("SELECT * FROM tutor WHERE cpf=?", (cpf_tutor,)).fetchone()
+        pet = self.db.executar("SELECT * FROM pet WHERE codigo=?", (codigo_pet,)).fetchone()
+        cuidados = self.db.executar("SELECT * FROM cuidados WHERE codigo_pet=?", (codigo_pet,)).fetchone()
+        
+        # Reconstrói os inputs dos formulários com dados SQL formatados
+        chaves_tutor = ["cpf", "nome", "celular", "email", "cep", "endereco", "bairro", "cidade", "uf"]
+        for i, chave in enumerate(chaves_tutor):
+            self.vars_tutor[chave].set(tutor[i])
+            
+        self.ent_pet_cpf.config(state="normal"); self.ent_pet_cpf.delete(0, tk.END); self.ent_pet_cpf.insert(0, pet[1]); self.ent_pet_cpf.config(state="readonly")
+        self.ent_pet_nome.delete(0, tk.END); self.ent_pet_nome.insert(0, pet[2])
+        self.cb_pet_tipo.set(pet[3]); self.ent_pet_raca.delete(0, tk.END); self.ent_pet_raca.insert(0, pet[4])
+        self.cb_pet_porte.set(pet[5]); self.ent_pet_nasc.delete(0, tk.END); self.ent_pet_nasc.insert(0, pet[6])
+        self.cb_pet_sexo.set(pet[7]); self.ent_pet_cor.delete(0, tk.END); self.ent_pet_cor.insert(0, pet[8])
+        
+        self.codigo_em_edicao = codigo_pet # Aciona lógica de Update do botão salvar
+        
+        if cuidados:
+            self.ent_care_cod.config(state="normal"); self.ent_care_cod.delete(0, tk.END); self.ent_care_cod.insert(0, cuidados[0]); self.ent_care_cod.config(state="readonly")
+            self.ent_care_comida.delete(0, tk.END); self.ent_care_comida.insert(0, cuidados[1])
+            self.ent_care_hora.delete(0, tk.END); self.ent_care_hora.insert(0, cuidados[2])
+            self.ent_care_alergia.delete(0, tk.END); self.ent_care_alergia.insert(0, cuidados[3])
+            
+        # Altera foco na GUI
+        self.notebook.select(self.abas["cadastro"]) 
+        self.sub_notebook.select(self.sub_abas["tutor"]) 
+        messagebox.showinfo("Modo de Edição", "Dados carregados com sucesso!\nAltere os campos na aba de Cadastro e clique em 'Salvar' para atualizar o banco de dados.")
+
+    # --- ABA 8: AJUSTES GLOBAIS ---
+    def construir_aba_ajustes(self):
+        """Gerencia variáveis de estado para troca de temas dinamicamente."""
+        f = self.abas["settings"]
+        ttk.Label(f, text="Idioma / Language:").pack(pady=10)
+        self.var_lang = tk.StringVar(value="BR")
+        ttk.Radiobutton(f, text="Português-BR", variable=self.var_lang, value="BR", command=self.mudar_idioma).pack()
+        ttk.Radiobutton(f, text="English-USA", variable=self.var_lang, value="EN", command=self.mudar_idioma).pack()
+
+        ttk.Label(f, text="Tema / Theme:").pack(pady=10)
+        self.var_tema = tk.StringVar(value="Claro")
+        ttk.Radiobutton(f, text="Modo Claro", variable=self.var_tema, value="Claro", command=self.mudar_tema).pack()
+        ttk.Radiobutton(f, text="Modo Escuro", variable=self.var_tema, value="Escuro", command=self.mudar_tema).pack()
+
+    def mudar_idioma(self):
+        """Modifica as strings do UI baseadas no dicionário self.textos[self.idioma]"""
+        self.idioma = self.var_lang.get()
+        for i, key in enumerate(["cadastro", "search", "report", "delete", "settings"]): self.notebook.tab(i, text=self.textos[self.idioma][key])
+        for i, key in enumerate(["tutor", "pet", "care", "vax"]): self.sub_notebook.tab(i, text=self.textos[self.idioma][key])
+        self.sub_abas["tutor"].winfo_children()[-1].config(text=self.textos[self.idioma]["save"])
+        self.sub_abas["pet"].winfo_children()[-1].config(text=self.textos[self.idioma]["save"])
+        self.sub_abas["care"].winfo_children()[-1].config(text=self.textos[self.idioma]["save"])
+        self.btn_pdf.config(text=self.textos[self.idioma]["gen_pdf"])
+        self.btn_pular.config(text=self.textos[self.idioma]["skip"])
+        self.btn_logout.config(text=self.textos[self.idioma]["logout"])
+
+    def mudar_tema(self):
+        self.tema_escuro = (self.var_tema.get() == "Escuro")
+        self.aplicar_tema()
+
+    def aplicar_tema(self):
+        """Sobrescreve a estilização (Stylesheet) da GUI do Tkinter dinamicamente."""
+        bg_color = "#2e2e2e" if self.tema_escuro else "#f0f0f0"
+        fg_color = "#ffffff" if self.tema_escuro else "#000000"
+
+        # Cores constantes de Tab/Notebook para garantir acessibilidade visual
+        if self.tema_escuro:
+            tab_fundo_barra = "#1e1e1e"; tab_fundo_desativada = "#454545"; tab_fundo_ativa = "#2e2e2e"; tab_texto = "#ffffff"; tab_hover = "#555555"
+        else:
+            tab_fundo_barra = "#e0e0e0"; tab_fundo_desativada = "#d9d9d9"; tab_fundo_ativa = "#f0f0f0"; tab_texto = "#000000"; tab_hover = "#e8e8e8"
+        
+        style = ttk.Style(); style.theme_use('clam')
+        
+        # Mapeamento e Estilização
+        style.configure("TNotebook", background=tab_fundo_barra, borderwidth=0)
+        style.configure("TNotebook.Tab", background=tab_fundo_desativada, foreground=tab_texto, padding=[10, 5])
+        style.map("TNotebook.Tab", background=[("selected", tab_fundo_ativa), ("active", tab_hover)], foreground=[("selected", tab_texto)])
+        style.configure("TFrame", background=bg_color)
+        style.configure("TLabel", background=bg_color, foreground=fg_color)
+        style.configure("TButton", background="#4a4a4a" if self.tema_escuro else "#e0e0e0", foreground=fg_color)
+        style.configure("TRadiobutton", background=bg_color, foreground=fg_color)
+        
+        self.root.configure(bg=bg_color)
+        self.header_autoria.configure(background=bg_color, foreground=fg_color)
+
+# Execução do script com base na hierarquia orientada a objetos (OOP)
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AppPet(root)
+    root.mainloop()
